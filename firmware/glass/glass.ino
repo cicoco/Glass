@@ -86,10 +86,11 @@ void maybe_send_audio(uint32_t now) {
     g_next_audio_due_ms = now + AUDIO_CHUNK_MS;
     return;
   }
+  const bool terminal_chunk = chunk.is_last || chunk.silence_exit_reached;
 
   JGFrameHeader header{};
   header.type = JG_FRAME_AUDIO;
-  header.flags = chunk.is_last ? JG_FLAG_AUDIO_LAST : 0;
+  header.flags = terminal_chunk ? JG_FLAG_AUDIO_LAST : 0;
   header.timestamp_ms = millis();
   header.session_id = session_controller_frame_session_id();
   header.payload_len = static_cast<uint32_t>(chunk.len);
@@ -97,8 +98,17 @@ void maybe_send_audio(uint32_t now) {
   tcp_server_send_frame(header, chunk.data);
   g_next_audio_due_ms = now + AUDIO_CHUNK_MS;
 
+  Serial.print(F("[VOICE] rms="));
+  Serial.print(chunk.rms_estimate);
+  Serial.print(F(" silence_ms="));
+  Serial.println(chunk.silence_accumulator_ms);
+
   if (chunk.is_last) {
     session_controller_on_audio_last_sent(Serial);
+    return;
+  }
+  if (chunk.silence_exit_reached) {
+    session_controller_request_end(APP_END_REASON_SILENCE, Serial);
   }
 }
 
@@ -156,4 +166,3 @@ void loop() {
   maybe_send_audio(now);
   delay(5);
 }
-

@@ -11,7 +11,7 @@
 - 用什么开发环境、库、板型
 - 引脚与驱动怎么配
 - 固件分几个任务/模块
-- 会话结束、升档、发送等行为的具体判定逻辑
+- 会话结束、升档、发送、静音退出等行为的具体判定逻辑
 - 目录结构与自检步骤
 
 ---
@@ -137,13 +137,16 @@ firmware/glass/
 #define ACTIVE_FPS_X10      25                  // 写入 WAKE payload
 
 // --- 音频 ---
-#define AUDIO_SAMPLE_RATE   16000
-#define AUDIO_BITS          16
-#define AUDIO_CHUNK_MS      320                 // 每块 320ms ≈ 10240 字节
-#define AUDIO_MAX_DURATION_MS 5000              // 最长录音 5s
+#define AUDIO_SAMPLE_RATE            16000
+#define AUDIO_BITS                   16
+#define AUDIO_CHUNK_MS               320        // 每块 320ms ≈ 10240 字节
+#define SILENCE_EXIT_SECONDS         3          // 连续静音 3 秒退出
+#define AUDIO_MAX_DURATION_SECONDS   180        // 默认 3 分钟，可调
+#define AUDIO_HIGHPASS_ALPHA         0.95f      // 一阶高通默认系数
+#define AUDIO_RMS_THRESHOLD          200        // 过滤后能量阈值，需实机校准
 
 // --- 会话 ---
-#define SESSION_TIMEOUT_MS  8000                // 无语音活动超时
+#define SESSION_TIMEOUT_SECONDS      300        // 默认 5 分钟兜底超时
 #define DEBOUNCE_MS         50
 #define WAKE_BTN_PIN        0                   // Boot 键
 
@@ -198,6 +201,12 @@ esp_camera_fb_get()
 
 升档期间允许 0.3–0.5s 无 IMAGE，符合 [`transport-mvp.md`](./transport-mvp.md)。
 
+### 6.4 Active 档保持策略
+
+- 进入 `SESSION_ACTIVE` 后，图像档位保持 `ACTIVE_FRAME_SIZE + ACTIVE_FPS_MS`
+- **不要** 因为短暂停顿或瞬时静音回落到 Idle 档
+- 只有在整段连续对话真正结束时，才执行降档回到 Idle
+
 ---
 
 ## 7. 音频实现
@@ -212,7 +221,7 @@ i2s.setPinsPdmRx(42, 41);  // CLK, DATA
 i2s.begin(I2S_MODE_PDM_RX, 16000, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
 ```
 
-### 7.2 采集与分块
+### 7.2 采集、过滤与分块
 
 | 项 | 约定 |
 |----|------|
@@ -220,12 +229,22 @@ i2s.begin(I2S_MODE_PDM_RX, 16000, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
 | 分块大小 | `16000 * 2 * AUDIO_CHUNK_MS / 1000` = **10240 字节** |
 | 发送 | 每块封装为 `AUDIO` 帧；末块 `flags \|= AUDIO_LAST` |
 | 缓冲 | 块缓冲放 PSRAM 或堆，单块 ~10KB |
+| 过滤 | 原始 PCM 先做基础高通/降噪，再进入能量检测与上送链路 |
 
-### 7.3 简单能量 VAD（本期可选增强）
+### 7.3 静音退出策略（本期必须实现）
 
-在 `AUDIO_MAX_DURATION_MS` 之前，若连续 **800ms** 样本 RMS < 阈值 `VAD_RMS_THRESHOLD`（默认 200，实现可调），可提前结束录音。
+- 过滤后音频按 chunk 计算 RMS 或等效能量
+- 当 chunk 能量高于 `AUDIO_RMS_THRESHOLD` 时，视为“检测到有效声音”
+- 当能量低于阈值时，累计静音时长
+- 连续静音达到 `SILENCE_EXIT_SECONDS` 后，触发退出会话
+- `AUDIO_MAX_DURATION_SECONDS` 和 `SESSION_TIMEOUT_SECONDS` 仅作安全保护，不作为主退出路径
 
-**本期默认策略**：不依赖 VAD 稳定性，以「最长 5s + 会话 8s 超时」为主，VAD 仅作提前结束的优化。
+### 7.4 音频上限与会话超时
+
+- `AUDIO_MAX_DURATION_SECONDS`：音频采集允许的最长时长，分钟级可配置
+- `SESSION_TIMEOUT_SECONDS`：整个连续对话会话的兜底超时，分钟级可配置
+- 两者统一用“秒”配置，内部实现时再转换为毫秒
+- 推荐关系：`SESSION_TIMEOUT_SECONDS >= AUDIO_MAX_DURATION_SECONDS`
 
 ---
 
@@ -250,7 +269,7 @@ i2s.begin(I2S_MODE_PDM_RX, 16000, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
 |------|--------|-----|-----------|------|
 | `TaskCapture` | 2 | 8KB | Idle 1000ms / Active 400ms | 抓 JPEG；Active 时读音频块 |
 | `TaskStream` | 2 | 6KB | 队列事件驱动 | `send_frame()`；发送失败丢帧 |
-| `TaskSession` | 1 | 4KB | 20ms 轮询 | 按键消抖、串口、`SESSION_TIMEOUT` |
+| `TaskSession` | 1 | 4KB | 20ms 轮询 | 按键消抖、串口、静音退出、`SESSION_TIMEOUT` |
 | `loop()` | — | — | 非阻塞 | 仅 `vTaskDelay` 或空；逻辑不进 loop |
 
 主线程 `setup()`：Serial → WiFi → Camera → TCP Server → 创建三任务 → 进入 Idle。
@@ -262,6 +281,7 @@ i2s.begin(I2S_MODE_PDM_RX, 16000, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
 | `QueueHandle_t frame_queue` | Capture → Stream，元素为 `FrameJob{type, buf, len, ts, sid, flags}` |
 | `volatile AppState` | Session 任务写，Capture/Stream 读 |
 | `EventGroup`（可选） | `SWITCHING_CAMERA` 标志，升档时 Capture 暂停 |
+| `silence_accumulator_ms` | Audio/Session 共享，记录连续静音时长 |
 
 ### 8.3 发送非阻塞
 
@@ -289,7 +309,7 @@ typedef enum {
 | 事件 | 当前状态 | 动作 | 下一状态 |
 |------|----------|------|----------|
 | `EVT_WAKE`（按键/串口 w） | IDLE | `session_id++`；发 `CONTROL_WAKE`；升档相机；`i2s.begin()`；记录 `session_start_ms` | ACTIVE |
-| `EVT_AUDIO_DONE` | ACTIVE | 末包 AUDIO 已发 | ACTIVE（待发 END） |
+| `EVT_SILENCE_EXIT` | ACTIVE | 发 `CONTROL_SESSION_END`；`i2s.end()`；降档相机 | IDLE |
 | `EVT_TIMEOUT` | ACTIVE | 发 `CONTROL_SESSION_END`；`i2s.end()`；降档相机 | IDLE |
 | `EVT_FORCE_END`（串口 e） | ACTIVE | 同 TIMEOUT | IDLE |
 | `EVT_AUDIO_MAX` | ACTIVE | 标记最后一包音频 → 发 END | IDLE |
@@ -297,10 +317,10 @@ typedef enum {
 ### 9.3 会话结束优先级（拍板）
 
 ```text
-1. 串口 e / 按键长按（可选）     → 立即 EVT_FORCE_END
-2. SESSION_TIMEOUT_MS (8s)     → EVT_TIMEOUT
-3. AUDIO_MAX_DURATION_MS (5s)  → EVT_AUDIO_MAX
-4. VAD 静音 800ms（若启用）      → EVT_AUDIO_MAX
+1. 串口 e / 按键长按（可选）              → 立即 EVT_FORCE_END
+2. 连续静音达到 SILENCE_EXIT_SECONDS      → EVT_SILENCE_EXIT
+3. AUDIO_MAX_DURATION_SECONDS 达上限      → EVT_AUDIO_MAX
+4. SESSION_TIMEOUT_SECONDS 达上限         → EVT_TIMEOUT
 ```
 
 收到 `EVT_WAKE` 后**只处理一次**，防抖期间忽略重复触发。
@@ -324,7 +344,7 @@ typedef enum {
 |----|------|
 | TCP Server | `WiFiServer`，`listen(8765)`；新 Client 接入时 `stop()` 旧 Client |
 | 无 Client | Capture 照常；Stream 从队列取帧但丢弃发送（或不入队，推荐后者省 CPU） |
-| 发送顺序 | 同 session：`WAKE` →（IMAGE/AUDIO 交错）→ `AUDIO_LAST` → `SESSION_END` |
+| 发送顺序 | 同 session：`WAKE` →（IMAGE/AUDIO 持续交错）→ `AUDIO_LAST` → `SESSION_END` |
 | `send_frame` | 小端写入 14 字节头；`payload_len==0` 时只发头 |
 | WAKE payload | 8 字节：`{1, 0, 640, 480, 25}` 按小端写入 |
 
@@ -361,7 +381,7 @@ typedef enum {
 [TCP] listening
 ```
 
-会话关键节点：`[WAKE] sid=1 ts=...`、`[END] sid=1 reason=timeout`、`[DROP] image count=...`
+会话关键节点：`[WAKE] sid=1 ts=...`、`[VOICE] rms=... silence_ms=...`、`[END] sid=1 reason=silence`、`[DROP] image count=...`
 
 ---
 

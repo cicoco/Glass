@@ -155,6 +155,8 @@ const char *session_controller_end_reason_name(AppEndReason reason) {
       return "timeout";
     case APP_END_REASON_FORCED:
       return "forced";
+    case APP_END_REASON_SILENCE:
+      return "silence";
     default:
       return "none";
   }
