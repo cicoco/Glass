@@ -52,8 +52,8 @@
 ## 3. 工程结构
 
 ```text
-firmware/juneglass-glass/
-├── juneglass-glass.ino          # setup/loop 入口，任务启动
+firmware/glass/
+├── glass.ino          # setup/loop 入口，任务启动
 ├── config.h                     # WiFi、端口、帧率等常量
 ├── camera_pins.h                # 可直接复用 esp32-camera 的 XIAO ESP32S3 定义
 ├── app/
