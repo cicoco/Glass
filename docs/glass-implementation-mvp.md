@@ -467,6 +467,7 @@ int  net_accept_client_blocking();  // 无 client 返回 -1
 ```text
 glass-implementation-mvp.md   ← 本文档（编码落地）
 glass-requirement-mvp.md      需求与验收
+glass-flash-and-debug.md      Arduino IDE 烧录与联调步骤
 transport-mvp.md              传输契约
 requirement-mvp.md            系统总览
 ```
